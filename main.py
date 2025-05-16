@@ -59,24 +59,41 @@ def save_checked_domains(domains: List[str]) -> None:
 
 
 def filter_already_checked_domains(
-    company_names: List[str], checked_domains: Set[str]
+    company_names: List[str], checked_domains: Set[str], tlds: List[str]
 ) -> List[str]:
     """
-    Filter out company names that would result in domain names that have already been checked.
+    Filter out company names that would result in domain names (for any specified TLD)
+    that have already been checked.
 
     Args:
         company_names: List of company names to filter
-        checked_domains: Set of domain names that have already been checked
+        checked_domains: Set of domain names that have already been checked (e.g., {'example.ai', 'test.com'})
+        tlds: List of TLDs to consider for each company name (e.g., ['.ai', '.com'])
 
     Returns:
-        List of company names that would result in new domain names
+        List of company names that would result in new domain names for all specified TLDs.
     """
     filtered_names = []
     filtered_out_count = 0
 
     for name in company_names:
-        domain_name = f"{name.lower().replace(' ', '')}.com"
-        if domain_name.lower() not in checked_domains:
+        # New logic: filter out if any TLD variation is already checked
+        should_filter_out = False
+        normalized_name_part = name.lower().replace(" ", "")
+
+        if (
+            not normalized_name_part
+        ):  # Handle cases where name might be empty or just spaces
+            filtered_out_count += 1
+            continue  # Skip this name
+
+        for tld in tlds:
+            domain_name_to_check = f"{normalized_name_part}{tld}"
+            if domain_name_to_check.lower() in checked_domains:
+                should_filter_out = True
+                break  # Found one checked domain, no need to check other TLDs for this name
+
+        if not should_filter_out:
             filtered_names.append(name)
         else:
             filtered_out_count += 1
@@ -93,7 +110,8 @@ def generate_company_names(
     prompt: str,
     num_names: int = 50,
     model: str = "gpt-4o",
-    checked_domains: Set[str] = None,
+    checked_domains: Set[str] | None = None,
+    tlds: List[str] | None = None,
 ) -> List[str]:
     """
     Generate company name ideas using OpenAI's API based on a prompt.
@@ -103,10 +121,14 @@ def generate_company_names(
         num_names: Number of names to generate
         model: OpenAI model to use
         checked_domains: Set of domain names that have already been checked
+        tlds: List of TLDs the names should be suitable for (e.g., ['.ai', '.com'])
 
     Returns:
         List of company name ideas
     """
+    if tlds is None:
+        tlds = [".ai"]
+
     try:
         client = openai.OpenAI()
 
@@ -145,7 +167,7 @@ def generate_company_names(
         Important guidelines:
         - Names should be 1 word maximum
         - Memorable and distinctive
-        - Good potential as a .com domain name
+        - Good potential as domain names with TLDs: {", ".join(tlds)}
         - No hyphens or special characters
         {domains_to_avoid}
         Return ONLY a JSON array of strings."""
@@ -263,16 +285,22 @@ def check_domain_availability(
     initial_delay_range: Tuple[float, float] = (0.2, 0.5),
     max_delay: float = 10.0,
     max_retries: int = 5,
+    tlds: List[str] | None = None,
 ) -> Dict[str, bool]:
     """
-    Check domain availability for a list of company names with adaptive rate limiting and exponential backoff.
+    Check domain availability for a list of company names across specified TLDs
+    with adaptive rate limiting and exponential backoff.
 
     Args:
         company_names: List of company names to check
         initial_delay_range: Tuple of (min, max) seconds to wait between initial requests
         max_delay: Maximum delay in seconds for backoff
         max_retries: Maximum number of retries on connection errors
+        tlds: List of TLDs to check for each company name (e.g., [".ai", ".com"])
     """
+    if tlds is None:
+        tlds = [".ai"]
+
     available_domains = {}
     total = len(company_names)
 
@@ -280,15 +308,34 @@ def check_domain_availability(
     consecutive_failures = 0
     current_delay_range = initial_delay_range
 
-    # Keep track of all checked domains
-    all_checked_domains = []
+    # Keep track of all domains checked in this specific run
+    all_checked_domains_in_run: List[str] = []
 
-    for idx, name in enumerate(company_names, 1):
-        domain_name = f"{name.lower().replace(' ', '')}.com"
+    # Prepare the list of actual domain names to check by combining company names and TLDs
+    domains_to_check_list: List[str] = []
+    for name in company_names:
+        normalized_name_part = name.lower().replace(" ", "")
+        if (
+            not normalized_name_part
+        ):  # Skip if the name part is empty after normalization
+            continue
+        for tld in tlds:
+            domains_to_check_list.append(f"{normalized_name_part}{tld}")
+
+    total_domains_to_check = len(domains_to_check_list)
+
+    if total_domains_to_check == 0:
+        print("No valid domains to check after processing company names and TLDs.")
+        # Still call save_checked_domains, it handles empty lists correctly (no-op)
+        save_checked_domains([])
+        return {}
+
+    # Iterate over the fully formed domain names
+    for idx, domain_name in enumerate(domains_to_check_list, 1):
         success = False
 
-        print(f"Checking {idx}/{total}: {domain_name}")
-        all_checked_domains.append(domain_name)
+        print(f"Checking {idx}/{total_domains_to_check}: {domain_name}")
+        all_checked_domains_in_run.append(domain_name)
 
         for attempt in range(max_retries):
             try:
@@ -339,7 +386,7 @@ def check_domain_availability(
             print(f"  Failed to check {domain_name} after {max_retries} attempts")
 
         # Adaptive delay between requests based on consecutive failures
-        if idx < total:  # Don't delay after the last request
+        if idx < total_domains_to_check:  # Don't delay after the last request
             # Increase delay if we're experiencing failures
             if consecutive_failures > 2:
                 # Gradually increase delay range up to max_delay
@@ -362,7 +409,7 @@ def check_domain_availability(
             time.sleep(delay)
 
     # Save all checked domains to the file
-    save_checked_domains(all_checked_domains)
+    save_checked_domains(all_checked_domains_in_run)
 
     return available_domains
 
@@ -409,6 +456,7 @@ def auto_generate_and_check(
     initial_delay_range: Tuple[float, float] = (0.2, 0.5),
     max_delay: float = 10.0,
     max_retries: int = 5,
+    tlds: List[str] | None = None,
 ) -> None:
     """
     Automatically generate company names and check domain availability in one go.
@@ -420,7 +468,13 @@ def auto_generate_and_check(
         initial_delay_range: Tuple of (min, max) seconds to wait between initial requests
         max_delay: Maximum delay in seconds for backoff
         max_retries: Maximum number of retries on connection errors
+        tlds: List of TLDs to check (e.g., [".ai", ".com"])
     """
+    if tlds is None:
+        tlds = [
+            ".ai"
+        ]  # Default to .ai if not provided, though main should always provide
+
     # Load existing domains to avoid duplicates
     existing_domains = load_existing_domains()
     print(
@@ -432,8 +486,12 @@ def auto_generate_and_check(
     print(f"Loaded {len(checked_domains)} previously checked domains")
 
     # Generate company names
-    print(f"\nGenerating {num_names} unique company names for: {prompt}")
-    company_names = generate_company_names(prompt, num_names, model, checked_domains)
+    print(
+        f"\nGenerating {num_names} unique company names for: {prompt} (TLDs: {', '.join(tlds)})"
+    )
+    company_names = generate_company_names(
+        prompt, num_names, model, checked_domains, tlds
+    )
 
     if not company_names:
         print("Failed to generate company names. Please try again.")
@@ -441,7 +499,7 @@ def auto_generate_and_check(
 
     # Filter out company names that would result in already checked domains
     original_count = len(company_names)
-    company_names = filter_already_checked_domains(company_names, checked_domains)
+    company_names = filter_already_checked_domains(company_names, checked_domains, tlds)
 
     if len(company_names) == 0:
         print(
@@ -459,7 +517,9 @@ def auto_generate_and_check(
         print(f"{i}. {name}")
 
     # Check domain availability
-    print(f"\nStarting domain checks for {len(company_names)} names...")
+    print(
+        f"\nStarting domain checks for {len(company_names)} names across TLDs: {', '.join(tlds)}..."
+    )
     print("This may take a few minutes due to rate limiting...")
     print("-" * 50)
 
@@ -468,58 +528,110 @@ def auto_generate_and_check(
         initial_delay_range=initial_delay_range,
         max_delay=max_delay,
         max_retries=max_retries,
+        tlds=tlds,
     )
 
-    # Group domains by availability
-    available = []
-    taken = []
-    errors = []
+    # Process results to determine availability at the company name level
+    company_availability_summary: Dict[str, Dict[str, List[str]]] = {}
+    all_actually_available_fqdns: List[str] = []  # For saving to file
 
-    for domain, status in results.items():
-        if status is True:
-            available.append(domain)
-        elif status is False:
-            taken.append(domain)
-        else:
-            errors.append((domain, status))
+    for name in company_names:  # Iterate over the unique base company names
+        normalized_name_part = name.lower().replace(" ", "")
+        if not normalized_name_part:  # Should have been filtered by generate_company_names or filter_already_checked
+            continue
 
-    # Print grouped results
-    print("\nDomain Availability Results")
+        company_availability_summary[name] = {"available": [], "taken": [], "error": []}
+
+        for tld in tlds:
+            domain_to_check = f"{normalized_name_part}{tld}"
+            status = results.get(domain_to_check)  # Get status for this specific FQDN
+
+            if status is True:
+                company_availability_summary[name]["available"].append(domain_to_check)
+                all_actually_available_fqdns.append(domain_to_check)
+            elif status is False:
+                company_availability_summary[name]["taken"].append(domain_to_check)
+            elif isinstance(status, str):  # Error message string
+                company_availability_summary[name]["error"].append(
+                    f"{domain_to_check}: {status}"
+                )
+            # If status is None, it means the domain wasn't in results (e.g., check failed silently or skipped)
+            # This case should be minimal if check_domain_availability processed all combinations.
+
+    # Prepare display lists
+    available_company_display_list = []
+    unavailable_company_display_list = []
+
+    for name, summary in company_availability_summary.items():
+        if summary[
+            "available"
+        ]:  # Company name is available if at least one TLD is available
+            available_details = ", ".join(summary["available"])
+
+            other_statuses = []
+            if summary["taken"]:
+                other_statuses.append(f"taken in: {', '.join(summary['taken'])}")
+            if summary["error"]:
+                other_statuses.append(f"errors for: {', '.join(summary['error'])}")
+
+            other_info_str = ""
+            if other_statuses:
+                other_info_str = f" (other TLDs - {'; '.join(other_statuses)})"
+
+            available_company_display_list.append(
+                f"  • {name} (available as: {available_details}){other_info_str}"
+            )
+        else:  # Not available in any specified TLD for this company name
+            parts = []
+            if summary["taken"]:
+                parts.append(f"taken in: {', '.join(summary['taken'])}")
+            if summary["error"]:
+                parts.append(f"errors for: {', '.join(summary['error'])}")
+
+            detail_str = "; ".join(parts)
+            if not detail_str:
+                # This case implies the name was processed but no TLDs resulted in True/False/Error string.
+                # Could happen if all results were None for its TLDs, or if name had no TLDs (unlikely here).
+                detail_str = "status unknown for all TLDs or no TLDs processed"
+
+            unavailable_company_display_list.append(f"  • {name} ({detail_str})")
+
+    # Print grouped results based on company name availability
+    print("\nCompany Name Availability Results")
     print("=" * 50)
 
-    print("\n✅ AVAILABLE DOMAINS:")
+    print("\n✅ COMPANY NAMES AVAILABLE (in at least one specified TLD):")
     print("-" * 20)
-    if available:
-        for domain in sorted(available):
-            print(f"  • {domain}")
+    if available_company_display_list:
+        for item in sorted(available_company_display_list):
+            print(item)
     else:
         print("  None found")
 
-    print("\n❌ TAKEN DOMAINS:")
+    print("\n❌ COMPANY NAMES NOT AVAILABLE (in any specified TLD):")
     print("-" * 20)
-    if taken:
-        for domain in sorted(taken):
-            print(f"  • {domain}")
+    if unavailable_company_display_list:
+        for item in sorted(unavailable_company_display_list):
+            print(item)
     else:
-        print("  None found")
+        print("  None found (or all were available)")
 
-    if errors:
-        print("\n⚠️ ERRORS CHECKING:")
-        print("-" * 20)
-        for domain, error in errors:
-            print(f"  • {domain}: {error}")
+    # Summary based on company names
+    total_company_names_processed = len(company_names)
+    num_companies_available = len(available_company_display_list)
+    num_companies_unavailable = len(unavailable_company_display_list)
 
-    # Print summary
-    print("\nSummary:")
-    print(f"Total checked: {len(results)}")
-    print(f"Available: {len(available)}")
-    print(f"Taken: {len(taken)}")
-    print(f"Errors: {len(errors)}")
+    print("\nSummary (based on Company Names):")
+    print(f"Total company names processed: {total_company_names_processed}")
+    print(f"Company names available in at least one TLD: {num_companies_available}")
+    print(f"Company names not available in any TLD: {num_companies_unavailable}")
 
-    # Save available domains automatically
-    if available:
-        print("\nSaving available domains...")
-        save_available_domains(available, existing_domains)
+    # Save all *actually available FQDNs* to the file
+    if all_actually_available_fqdns:
+        print("\nSaving specific available domain names...")
+        save_available_domains(all_actually_available_fqdns, existing_domains)
+    else:
+        print("\nNo new specific domain names found to be available for saving.")
 
 
 def main():
@@ -579,8 +691,25 @@ def main():
         action="store_true",
         help="Clear the history of checked domains",
     )
+    parser.add_argument(
+        "--tlds",
+        type=str,
+        nargs="+",  # Accepts one or more arguments
+        default=[".ai"],
+        help="List of TLDs to search (e.g., .com .io .ai). Default: .ai",
+    )
 
     args = parser.parse_args()
+
+    # Sanitize TLDs to ensure they start with a dot
+    sanitized_tlds = []
+    for tld in args.tlds:
+        if not tld.startswith("."):
+            sanitized_tlds.append(f".{tld}")
+        else:
+            sanitized_tlds.append(tld)
+    args.tlds = list(set(sanitized_tlds))  # Remove duplicates and update args
+    print(f"TLDs to search: {args.tlds}")
 
     # Handle clearing history if requested
     if args.clear_history:
@@ -620,6 +749,7 @@ def main():
                 initial_delay_range=(args.min_delay, args.max_delay),
                 max_delay=args.backoff_max,
                 max_retries=args.retries,
+                tlds=args.tlds,  # Pass sanitized TLDs
             )
     else:
         # Non-interactive mode, requires prompt
@@ -635,6 +765,7 @@ def main():
             initial_delay_range=(args.min_delay, args.max_delay),
             max_delay=args.backoff_max,
             max_retries=args.retries,
+            tlds=args.tlds,  # Pass sanitized TLDs
         )
 
 
